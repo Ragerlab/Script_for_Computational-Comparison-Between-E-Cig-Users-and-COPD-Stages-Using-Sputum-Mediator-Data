@@ -1,6 +1,6 @@
 # Script_for_Computational-Comparison-Between-E-Cig-Users-and-COPD-Stages-Using-Sputum-Mediator-Data
 
-Script for *Computational Comparison Between E-Cig Users and COPD Stages Using Sputum Mediator Data*.
+Script for *Computational Comparison Between E-Cig Users and COPD Stages Using Sputum Mediator Data* (manuscript currently in submission).
 
 This study set out to compare induced sputum soluble mediator profiles between e-cigarette users and participants with different stages of COPD using a suite of computational approaches. 
 
