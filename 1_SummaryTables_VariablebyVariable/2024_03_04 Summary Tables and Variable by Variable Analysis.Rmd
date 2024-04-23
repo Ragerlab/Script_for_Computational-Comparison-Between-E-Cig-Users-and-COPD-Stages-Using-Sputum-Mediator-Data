@@ -1,0 +1,1088 @@
+---
+title: "COPD Summary Tables and Variable by Variable Analysis"
+author: "Elise Hickman"
+date: "Most recent revision date: 3/4/2024"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_depth: 6
+    number_sections: true
+---
+
+# Load packages
+
+```{r message = FALSE, warning = FALSE}
+# Clears global environment
+rm(list = ls(all.names = TRUE)) 
+
+# If needed, install and load packages
+library(openxlsx) # for data import
+library(janitor) # for data organization
+library(tidyverse) # for data cleaning and organization
+library(table1) # to make tables
+library(rstatix) # for Dunn's test
+library(FSA) # package that contains Dunn test function
+library(DT) # for display of data tables
+library(multcomp) #for Tukey's post hoc
+library(ggfortify) # for PCA
+library(factoextra) # for PCA 
+library(pheatmap) # for making heatmap
+library(viridis) # for heatmap color scheme
+```
+
+# Data Import and Organization
+
+## Soluble Mediator Data
+
+Data import.
+```{r}
+# Import single-plex (sp) mediator data (md)
+md_sp <- data.frame(read.xlsx("1_Raw_InputFiles/2022_04_19 COPD Mediator Data Single ELISAs.xlsx"))
+
+# Import mesoscale (msd) mediator data (md)
+md_msd <- data.frame(read.xlsx("1_Raw_InputFiles/2022_04_19 COPD Mediator Data MSD.xlsx"))
+
+# Combine data from single-plex and MSD matricies
+md <- left_join(md_sp, md_msd, by = "ExpSampleID")
+
+# Remove unnecessary sample identification columns
+md <- dplyr::select(md, -c(LAB_ID, ExpSampleID))
+```
+
+We realized after completing assays that some of the subjects were measured in duplicate. The below code averages the duplicates (manual calling of the specific subjects that were duplicates).
+```{r}
+# Extract rows from samples that have duplicate measurements
+md_duplicates_avg <- filter(md, SubjectID == 'MU160833' | 
+                              SubjectID == 'SF181538' | 
+                              SubjectID == 'UT171009') %>% group_by(SubjectID) %>% summarize(across(everything(), mean))
+
+# Remove rows from original data frame that contain data from the duplicate subjects
+md <- md[!grepl("MU160833", md$SubjectID), ]
+md <- md[!grepl("SF181538", md$SubjectID), ]
+md <- md[!grepl("UT171009", md$SubjectID), ]
+
+# Add back in averaged data for the duplicate samples
+md <- bind_rows(md, md_duplicates_avg)
+md <- data.frame(md[, -1], row.names = md$SubjectID)
+```
+
+Impute zeroes. 
+```{r}
+# Impute zeroes as the sqrt of the lowest value in that column.
+md <- as.data.frame(apply(md[ , 1:27], 2, function(x) replace(x, x == 0, sqrt(min(x[x>0])))))
+
+# Filter out mediators that were detected in fewer than 27 subjects (~25% of the cohort, since we have four groups).
+md <- md[, which(as.numeric(colSums(md != 0)) > 27)]
+
+# Put column names in alphabetical order
+md <- md[,order(names(md))]
+```
+
+## Sputum Cell Differential Data
+
+Initial import and filtering.
+```{r}
+# Import
+diffs <- read.xlsx("1_Raw_InputFiles/2022_07_14 COPD Raw Diff Data.xlsx")
+
+# Create vector of subject IDs to filter on
+subject_ids <- row.names(md)
+
+# Filter data to only include data from subjects of interest
+diffs <- subset(diffs, SubjectID %in% subject_ids)
+```
+
+Calculate percentage and total counts based on non-squamous data as discussed with Dr. Alexis since initial input file didn't calculate them correctly. 
+```{r}
+# Calculate new percentage parameters
+
+for (i in 3:7) {
+  diffs$newcol <- diffs[[i]]/diffs[[10]]*100 # Divide count by total nonsquamous count, times 100
+  cell <- strsplit(colnames(diffs)[i], split = "_") # Create variable for name of cell type
+  cell <- noquote(cell[[1]][1]) # Create variable for name of cell type
+  
+  names(diffs)[names(diffs) == 'newcol'] <- noquote(paste0(cell, "_Perc")) # Rename column
+}
+
+# Calculate new total cell parameters
+
+for (i in 15:19) {
+  diffs$newcol <- diffs[[i]]/100*(diffs[[14]]-diffs[[13]]) # Multiply percentage by total cell count - squamous cell count
+  cell <- strsplit(colnames(diffs)[i], split = "_") # Create variable for name of cell type
+  cell <- noquote(cell[[1]][1]) # Create variable for name of cell type
+  
+  names(diffs)[names(diffs) == 'newcol'] <- noquote(paste0(cell, "_Count")) # Rename column
+}
+
+  
+# Remove columns not of interest
+diffs <- diffs[, -c(2:11)]
+```
+
+Average duplicates. 
+```{r}
+# Make vector of subjects with two slides read
+duplicated_diff_subjects <- diffs$SubjectID[duplicated(diffs$SubjectID)]
+
+# Filter data frame to only include those subjects
+duplicate_diffs <- subset(diffs, SubjectID %in% duplicated_diff_subjects)
+
+# Average values
+duplicate_diffs_avg <- duplicate_diffs %>% group_by(SubjectID) %>% summarize(across(c(1:13), mean))
+
+# Remove duplicated rows and unnecessary columns in data frame, format data frame
+diffs <- subset(diffs, !(SubjectID %in% duplicated_diff_subjects))
+diffs <- bind_rows(diffs, duplicate_diffs_avg)
+diffs <- data.frame(diffs[, -1], row.names = diffs$SubjectID)
+```
+
+## Demographics Data
+```{r}
+# Import Data
+demographics <- read.xlsx("1_Raw_InputFiles/2023_06_09 COPD Demographics.xlsx")
+
+# Clean data frame and make new column for GOLD Stage as it will appear 
+demographics <- data.frame(demographics[, -1], row.names = demographics$SubjectID) %>%
+  mutate("GoldStage" = recode(GoldStratum, "1" = "C", "2" = "p-COPD", 
+                                   "3" = "1/2", "4" = "3"))
+```
+
+# Make demographics table
+Prep for making table.
+```{r}
+# Identify factors that will be the columns in the table and specify the order they will appear.
+demographics$Sex <- factor(demographics$Sex, 
+                           levels=c("M", "F"), 
+                           labels=c("Male", "Female"))
+
+demographics$Race <- factor(demographics$Race, 
+                               levels=c("W", "B", "MO", "M"), 
+                               labels=c("White", "Black", "Mixed/Other", "Missing"))
+
+
+demographics$GoldStage <- factor(demographics$GoldStage, 
+                            levels=c("C", "p-COPD", "1/2", "3"), 
+                            labels=c("Control", "Pre-COPD", 
+                                     "Mild/Moderate COPD (GOLD 1/2)", "Severe COPD (GOLD 3)"))
+
+# Create row labels for variables of interest that need reformatting
+label(demographics$PercPredFEV1) <- "% Predicted FEV1"
+label(demographics$SmokingPackYears) <- "Smoking Pack Year History"
+label(demographics$CurrentSmoker) <- "Current Smoker"
+label(demographics$Cotinine) <- "Urine Cotinine"
+label(demographics$GoldStageCOPDSev) <- "GOLD Stage"
+
+# Determine whether continuous variabes are normally or non-normally distributed
+shapiro.test(demographics$Age) # p-value = 0.01591 indicates non-normally distributed
+shapiro.test(demographics$BMI) # p-value = 0.06101 indicates normally distributed
+shapiro.test(demographics$PercPredFEV1) # p-value = 3.593e-0.05 indicates non-normally distributed
+shapiro.test(demographics$SmokingPackYears) # p-value = 8.736e-05 indicates non-normally distributed
+shapiro.test(demographics$Cotinine) # p-value = 9.268e-15 indicates non-normally distributed
+
+# Create function for custom table so that Mean (SD) is shown for continuous variables
+my.render.cont <- function(x) {
+  with(stats.apply.rounding(stats.default(x), digits=2), c("",
+                                                           "Mean (SD)"=sprintf("%s (&plusmn; %s)", MEAN, SD)))
+}
+
+
+# Function for adding p-values to table
+pvalue <- function(x, ...) {
+  # Construct vectors of data y, and groups (strata) g
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  if (is.numeric(y)) {
+    # For numeric variables, perform a non-parametric multiple comparisons test (Kruskal Wallis)
+    p <- kruskal.test(y ~ g)$p.value
+  } else {
+    # For categorical variables, perform a Fisher's exact test (or Chi squared if there are expected frequencies >5)
+    # Simulate p value = TRUE added because groups are too small
+    p <- fisher.test(table(y, g), simulate.p.value = TRUE)$p.value
+  }
+  # Format the p-value, using an HTML entity for the less-than sign.
+  # The initial empty string places the output on the line below the variable label.
+  c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+```
+
+Make table.
+```{r}
+# Must set seed when fisher's exact test has simulate = TRUE
+set.seed(8016)
+
+# Make table of demographics.
+demotable <- table1(~ Sex + Race + Hispanic + Age + BMI + PercPredFEV1 + SmokingPackYears + CurrentSmoker + Cotinine  | GoldStage, 
+       data = demographics, 
+       render.continuous = my.render.cont,
+       overall = NULL,
+       extra.col = list(`P-value` = pvalue))
+
+demotable
+```
+
+
+Code for manually adding additional significance markers to demographics table for continuous variables.
+```{r warning = FALSE}
+# Function to add significant numbers to data frame
+signif.num <- function(x) {
+  symnum(x, corr = FALSE, na = FALSE, legend = FALSE,
+         cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), 
+         symbols = c("***", "**", "*", "+", " "))
+}
+
+# Function for Dunn test and nicely formatted results
+dunn.test <- function(variable, group, data) {
+  res <- dunnTest(as.formula(paste0(variable, "~", group)), data = data, method = "bh")
+  res <- data.frame(res$res)
+  res <- format(res, scientific = FALSE)
+  res$AdjSignif <- signif.num(as.numeric(res$P.adj))
+  res
+}
+
+AgeDunnRes <- dunn.test("Age", "GoldStage", demographics)
+BMIDunnRes <- dunn.test("BMI", "GoldStage", demographics)
+FEV1DunnRes <- dunn.test("PercPredFEV1", "GoldStage", demographics)
+PackYrDunnRes <- dunn.test("SmokingPackYears", "GoldStage", demographics)
+CotinineDunnRes <- dunn.test("Cotinine", "GoldStage", demographics)
+```
+
+# Further subject characteristic exploration 
+
+Determine whether urine cotinine values seem to match whether a subject was classified as a current smoker or nonsmoker.
+```{r message = FALSE}
+theme_set(theme_bw())
+
+demographics$CurrentSmoker <- factor(demographics$CurrentSmoker, c("Yes", "No", "Missing"))
+
+demographics$GoldStage <- factor(demographics$GoldStage, 
+                            levels=c("Control", "Pre-COPD", 
+                                     "Mild/Moderate COPD (GOLD 1/2)", "Severe COPD (GOLD 3)"), 
+                            labels=c("C", "p-COPD","1/2", "3"))
+
+smoker_cotinine_plot <- ggplot(demographics, aes (x = GoldStage, y = Cotinine)) +
+  geom_boxplot(color = "black",
+               outlier.shape = NA) +
+  geom_jitter(position = position_jitter(0.15),
+              aes(color = CurrentSmoker),
+              size = 2) +
+  labs(y = "Urine Cotinine", x = "GOLD Stage") +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.7))) +
+  theme(axis.text.x = element_text(size = 12, color = "black"),
+        axis.text.y = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_text (size = 14),
+        legend.position = c(0.2, 0.75),
+        legend.background = element_rect(fill = "white", 
+                                         size = 0.3, 
+                                         linetype = "solid",
+                                         color = "black"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  scale_color_viridis_d(name = "Current Smoker", begin = 0.2, end = 0.8, option = "B")
+
+smoker_cotinine_plot
+```
+
+# Analysis of between-group differences in sputum cell differentials 
+
+## Assess normality of raw differential data
+
+Normality can be assessed in multiple ways - through statistical testing or manual examination of histograms (qqplots can also be used). 
+
+&nbsp;
+
+Statistical testing of normality for each sputum metric indicates that data are not normally distributed (as expected).
+```{r}
+# Test normality of each sputum metric
+diff_normality <- apply(diffs, 2, shapiro.test)
+
+# Create data frame to summarize results
+diff_normality <- do.call(rbind.data.frame, diff_normality)
+diff_normality <- format(diff_normality, scientific = FALSE)
+
+# Add column to adjust for multiple hypothesis testing
+diff_normality$p.value.adj <- p.adjust(diff_normality$p.value, "BH")
+
+# Add column for normality conclusion
+diff_normality <- diff_normality %>% mutate(normal = ifelse(p.value.adj < 0.05, F, T))
+
+datatable(diff_normality)
+```
+
+Histograms also demonstrate that data are not normally distributed. 
+```{r warning = FALSE, message = FALSE}
+diffs_histograms <- diffs %>% pivot_longer(all_of(colnames(diffs)), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(Value)) +
+  geom_histogram() +
+  facet_wrap(~ Variable, scales = "free")
+
+diffs_histograms
+```
+
+## Summary table of raw differential data
+
+Prepare data frame:
+```{r}
+# Merge diff data and gold stratum
+diffs_table <- transform(merge(diffs %>% dplyr::select(-c(SEC_Count, SEC_Perc)), demographics, by = 0), row.names=Row.names, Row.names = NULL)
+```
+
+Make summary table of means and SDs.
+```{r}
+# Calculate means
+diffs_table_means <- diffs_table %>%
+  group_by(GoldStage) %>%
+  summarise(across(1:11, mean, na.rm = TRUE)) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value > 1000, round(Value, digits = 0), round(Value, digits = 2))) %>%
+  mutate(Value = format(Value, big.mark = ",")) %>%
+  mutate(Value = case_when(grepl(".00", Value) ~ sub(".0+$", "", Value), .default = as.character(Value))) %>%
+  mutate(Value = trimws(Value)) %>%
+  rename("mean" = "Value") %>%
+  unite("GoldStage_Variable", GoldStage, Variable, sep = "_", remove = FALSE)
+
+# Store plus/minus character
+x<-"\u00b1"
+Encoding(x)<-"UTF-8"
+start_paren <- paste0("(", x, " ", sep = "")
+
+# Calculate standard deviations
+diffs_table_sd <- diffs_table %>%
+  group_by(GoldStage) %>%
+  summarise(across(1:11, sd, na.rm = TRUE)) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value > 1000, round(Value, digits = 0), round(Value, digits = 2))) %>%
+  mutate(Value = format(Value, big.mark = ",")) %>%
+  mutate(Value = case_when(grepl(".00", Value) ~ sub(".0+$", "", Value), .default = as.character(Value))) %>%
+  mutate(Value = trimws(Value)) %>%
+  mutate(Value = paste0(start_paren, Value, ")", sep ="")) %>%
+  rename("SD" = "Value") %>%
+  unite("GoldStage_Variable", GoldStage, Variable, sep = "_", remove = FALSE)
+
+# Combine data frames and reformat 
+diffs_table_summarystats <- left_join(diffs_table_means, 
+                                      diffs_table_sd %>% dplyr::select(c(GoldStage_Variable, SD)),
+                                      by = "GoldStage_Variable") %>%
+  unite("Mean_SD", mean, SD, sep = " ", remove = TRUE) %>%
+  dplyr::select(-c(GoldStage_Variable)) %>%
+  pivot_wider(names_from = GoldStage, values_from = Mean_SD)
+```
+
+Perform Kruskal-Wallis test to determine overall significant differences between groups.
+```{r}
+# Perform Kruskal-Wallis test
+kruskal_res <- diffs_table %>%
+  dplyr::select(c(TCCwSEC:BEC_Count, GoldStage)) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  do(tidy(kruskal.test(x = .$Value, g = .$GoldStage))) %>%
+  dplyr::select(c(Variable, p.value)) %>%
+  rename("p-value" = "p.value")
+
+# Apply BH correction
+kruskal_res$`Adjusted p-value` <- p.adjust(kruskal_res$`p-value`, method = "BH")
+```
+
+Merge summary data frame and overall p-value data frame.
+```{r}
+# Create data frame
+diffs_summary_table_final <- left_join(diffs_table_summarystats, 
+                                       kruskal_res %>% dplyr::select(c("Adjusted p-value", "Variable")), 
+                                                                     by = "Variable")
+
+# Write out data frame
+write.xlsx(diffs_summary_table_final, file = "2_OutputTables/DifferentialDataSummaryTable.xlsx")
+```
+
+
+Perform Dunn's post hoc to determine significance of between-group comparisons.
+```{r}
+# Create variable and group names
+diffs_table$GoldStage <- factor(diffs_table$GoldStage, 
+                            levels=c("C", "p-COPD", "1/2", "3"), 
+                            labels=c("Control", "Pre-COPD","GOLD 1/2", "GOLD 3"))
+
+groups <- names(diffs_table)[28]
+variables_diffs <- names(diffs_table) [1:11]
+
+# Perform Dunn's test
+DiffDunnTestRes <- lapply(variables_diffs, function(x) {
+  rstatix::dunn_test(diffs_table, reformulate(groups, x),  
+                     p.adjust.method = "BH")
+})
+
+# Summarize results
+DiffDunnRes <- data.frame()
+
+for (i in 1:length(variables_diffs)) {
+  data <- data.frame(DiffDunnTestRes[[i]])
+  DiffDunnRes <- bind_rows(data, DiffDunnRes)
+}
+
+DiffDunnResTrimmed <- filter(DiffDunnRes, p.adj.signif != "ns")
+
+DiffDunnRes_forpaper <- DiffDunnRes %>%
+  dplyr::select(-c(n1, n2, statistic, p, p.adj.signif)) %>%
+  unite(Comparison, group1, group2, sep = " - ") %>%
+  mutate(p.adj = round(p.adj, digits = 6)) %>%
+  pivot_wider(names_from = '.y.', values_from = p.adj) %>%
+  t() %>% as.data.frame() %>%
+  row_to_names(row_number = 1) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  rownames_to_column("Variable")
+
+# Create workbook to store these results and other statistical results for the supplementary tables
+wb <- createWorkbook()
+
+# Create bold style for workbook
+bold <- createStyle(textDecoration = "bold")
+
+# Add worksheet and format worksheet for these results
+addWorksheet(wb, "Diffs_Dunn_Results")
+writeData(wb, "Diffs_Dunn_Results", DiffDunnRes_forpaper)
+conditionalFormatting(wb, sheet = "Diffs_Dunn_Results", 
+                      cols = 2:6, rows = 2:12, rule = "<0.05", style = bold)
+
+# Write out table for paper.
+saveWorkbook(wb, "2_OutputTables/Variable_by_Variable_Supplemental_Results.xlsx", overwrite = TRUE)
+```
+## Assessment of squamous epithelial cell data
+
+Squamous epithelial cell percentages are considered to be an indicator of sample quality - too high of a squamous epithelial cell percentage can indicate that the sample was derived more from the upper airways than the central airways. Different cutoffs are used; we used a cutoff of <80% when selecting our samples initially.
+```{r}
+squam <- mean(diffs$SEC_Perc)
+squam_sem <- (sd(diffs$SEC_Perc))/(sqrt(length(diffs$SEC_Perc)))
+squam_max <- max(diffs$SEC_Perc)
+hist(diffs$SEC_Perc)
+```
+
+## ANCOVA on cell differential data
+
+ANCOVA will allow us to determine significant differences between group for each mediator while accounting for covariates. Choosing covariates is subjective, but here I included those that were significantly different in the demographics table, plus sex because of known differences between male and female airway immune responses and biology. 
+
+$~$
+
+First, data are log transformed to move data closer to a normal distribution, as there isn't a non-parametric alternative to ANCOVA. 
+```{r}
+# Remove columns we aren't interested in (squamous epithelial cells)
+diffs <- diffs[ , -c(1:2)]
+
+# Add one to every data in the matrix and log2 transform to avoid negative values.
+DiffDataLog <- log2(diffs[1:11]+1)
+
+# Test normality of each sputum metric
+DiffNormLog <- apply(DiffDataLog, 2, shapiro.test)
+
+# Create data frame to summarize results
+DiffNormLog <- do.call(rbind.data.frame, DiffNormLog)
+DiffNormLog <- format(DiffNormLog, scientific = FALSE)
+
+# Add column to adjust for multiple hypothesis testing
+DiffNormLog$p.value.adj <- p.adjust(DiffNormLog$p.value, "BH")
+
+# Add column for normality conclusion
+DiffNormLog <- DiffNormLog %>% mutate(normal = ifelse(p.value.adj < 0.05, F, T)) 
+
+datatable(DiffNormLog)
+```
+
+$~$
+
+Viewing histograms and Shapiro-Wilk p-values indicates that although log-transforming values does not make the data perfectly normal, it does get closer to normal.
+```{r warning = FALSE, message = FALSE}
+diffs_log2_histograms <- DiffDataLog %>% pivot_longer(all_of(colnames(DiffDataLog)), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(Value)) +
+  geom_histogram() +
+  facet_wrap(~ Variable, scales = "free")
+
+diffs_log2_histograms
+```
+
+Perform ANCOVA on cell differential data.
+
+```{r warning = FALSE}
+# Merge back cell differential data with metadata
+AllDiffDataLog <- transform(merge(demographics, DiffDataLog, by = 0), row.names=Row.names, Row.names = NULL)
+
+# Remove demographics not of interest, order columns
+AllDiffDataLog <- AllDiffDataLog %>%
+  dplyr::select(-c(Hispanic, Race.Original, Race, PercPredFEV1, GoldStageCOPDSev, GoldStratum, SmokingPackYears,  Anabasine:NRNC))
+AllDiffDataLog <- AllDiffDataLog %>% relocate(GoldStage)
+
+# Create empty data frame
+ANCOVAres_diffs = data.frame()
+
+# Add row names to data frame so that it will be able to add ANCOVA results
+rownames <- c("(Intercept)", "GoldStage", "BMI", "Age", "Sex", "CurrentSmoker", "Residuals")
+ANCOVAres_diffs <- data.frame(cbind(rownames))
+
+# Assign row names 
+ANCOVAres_diffs <- data.frame(ANCOVAres_diffs[, -1], row.names = ANCOVAres_diffs$rownames)
+
+# Perform ANCOVA over all columns in 
+for (i in 6:ncol(AllDiffDataLog)) {
+  
+  fit = aov(as.formula(paste0(names(AllDiffDataLog)[i], "~", paste0("`", names(AllDiffDataLog[1:5]), "`", collapse="+"), sep = "")), AllDiffDataLog)
+  res <- data.frame(car::Anova(fit, type="III"))
+  res <- subset(res, select = Pr..F.)
+  names(res)[names(res) == 'Pr..F.'] <- noquote(paste0(names(AllDiffDataLog[i])))
+  
+  ANCOVAres_diffs <- transform(merge(ANCOVAres_diffs, res, by = 0), row.names=Row.names, Row.names = NULL)
+}
+
+# Put columns in alphabetical order
+ANCOVAres_diffs <- ANCOVAres_diffs[, order(names(ANCOVAres_diffs))]
+
+# Transpose for easy viewing
+ANCOVAres_diffs <- data.frame(t(ANCOVAres_diffs))
+
+# Delete columns for intercept and residuals
+ANCOVAres_diffs <- subset(ANCOVAres_diffs, select = c(GoldStage, Sex, Age, BMI, CurrentSmoker))
+ANCOVAres_diffs_adj <- ANCOVAres_diffs %>%
+  mutate(across(everything(), p.adjust, "BH"))
+
+# Remove scientific notation and round
+options(scipen = 999)
+ANCOVAres_diffs_adj <- round(ANCOVAres_diffs_adj, 6)
+
+# Add worksheet and format worksheet for these results
+addWorksheet(wb, "Diffs_ANCOVA_Results")
+writeData(wb, "Diffs_ANCOVA_Results", ANCOVAres_diffs_adj %>% rownames_to_column("Variable"))
+conditionalFormatting(wb, sheet = "Diffs_ANCOVA_Results", 
+                      cols = 2:6, rows = 2:12, rule = "<0.05", style = bold)
+
+# Write out table for paper.
+saveWorkbook(wb, "2_OutputTables/Variable_by_Variable_Supplemental_Results.xlsx", overwrite = TRUE)
+```
+
+# Analysis of between-group differences in induced sputum supernatant soluble mediators
+
+## Assess normality of raw mediator data
+```{r}
+# Test normality of each mediator
+md_normality <- apply(md, 2, shapiro.test)
+
+# Create data frame to summarize results
+md_normality <- do.call(rbind.data.frame, md_normality)
+md_normality <- format(md_normality, scientific = FALSE)
+
+# Add column to adjust for multiple hypothesis testing
+md_normality$p.value.adj <- p.adjust(md_normality$p.value, "BH")
+
+# Add column for normality conclusion
+md_normality <- md_normality %>% mutate(normal = ifelse(p.value.adj < 0.05, F, T))
+
+datatable(md_normality)
+```
+
+$~$
+
+Histograms also demonstrate that data are not normally distributed.
+```{r, message = FALSE, warning = FALSE}
+md_histograms <- md %>% pivot_longer(all_of(colnames(md)), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(Value)) +
+  geom_histogram() +
+  facet_wrap(~ Variable, scales = "free")
+
+md_histograms
+```
+
+## Summary table of raw mediator data
+
+Create summary values:
+
+```{r}
+# Merge mediator data and gold stratum
+md <- transform(merge(md, demographics, by = 0), row.names=Row.names, Row.names = NULL) %>%
+  dplyr::select(c(ALB:VEGF, GoldStage))
+
+# Store plus/minus character
+x<-"\u00b1"
+Encoding(x)<-"UTF-8"
+start_paren <- paste0("(", x, " ", sep = "")
+
+# Calculate means
+md_table_means <- md %>%
+  group_by(GoldStage) %>%
+  summarise(across(1:(ncol(md)-1), mean, na.rm = TRUE)) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value > 1000, round(Value, digits = 0), round(Value, digits = 2))) %>%
+  mutate(Value = format(Value, big.mark = ",")) %>%
+  mutate(Value = case_when(grepl(".00", Value) ~ sub(".0+$", "", Value), .default = as.character(Value))) %>%
+  mutate(Value = trimws(Value)) %>%
+  rename("mean" = "Value") %>%
+  unite("GoldStage_Variable", GoldStage, Variable, sep = "_", remove = FALSE)
+
+# Calculate standard deviations
+md_table_sd <- md %>%
+  group_by(GoldStage) %>%
+  summarise(across(1:(ncol(md)-1), sd, na.rm = TRUE)) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value > 1000, round(Value, digits = 0), round(Value, digits = 2))) %>%
+  mutate(Value = format(Value, big.mark = ",")) %>%
+  mutate(Value = case_when(grepl(".00", Value) ~ sub(".0+$", "", Value), .default = as.character(Value))) %>%
+  mutate(Value = trimws(Value)) %>%
+  mutate(Value = paste0(start_paren, Value, ")", sep ="")) %>%
+  rename("SD" = "Value") %>%
+  unite("GoldStage_Variable", GoldStage, Variable, sep = "_", remove = FALSE)
+
+# Combine data frames and reformat 
+md_table_summarystats <- left_join(md_table_means, 
+                                      md_table_sd %>% dplyr::select(c(GoldStage_Variable, SD)),
+                                      by = "GoldStage_Variable") %>%
+  unite("Mean_SD", mean, SD, sep = " ", remove = TRUE) %>%
+  dplyr::select(-c(GoldStage_Variable)) %>%
+  pivot_wider(names_from = GoldStage, values_from = Mean_SD)
+```
+
+Perform Kruskal-Wallis test to determine overall significant differences between groups.
+```{r}
+# Perform Kruskal-Wallis test
+kruskal_res_md <- md %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  do(tidy(kruskal.test(x = .$Value, g = .$GoldStage))) %>%
+  dplyr::select(c(Variable, p.value)) %>%
+  rename("p-value" = "p.value")
+
+# Apply BH correction
+kruskal_res_md$`Adjusted p-value` <- p.adjust(kruskal_res_md$`p-value`, method = "BH")
+```
+
+Merge summary data frame and overall p-value data frame.
+```{r}
+# Create data frame
+md_summary_table_final <- left_join(md_table_summarystats, 
+                                       kruskal_res_md %>% dplyr::select(c("Adjusted p-value", "Variable")), 
+                                                                     by = "Variable") %>%
+  rename("Kruskal-Wallis Adjusted P-value (Crude Approach)" = "Adjusted p-value")
+
+```
+
+Perform Dunn's post hoc to determine significance of between-group comparisons and summarize in a table for paper supplement. 
+```{r}
+# Create variable and group names
+md$GoldStage <- factor(md$GoldStage, 
+                            levels=c("C", "p-COPD", "1/2", "3"), 
+                            labels=c("Control", "Pre-COPD","GOLD 1/2", "GOLD 3"))
+
+# Create group and variable names
+groups <- names(md)[28]
+variables_mediators <- names(md %>% dplyr::select(-GoldStage))
+
+# Run Dunn's Test
+MediatorDunnTestRes <- lapply(variables_mediators, function(x) {
+  rstatix::dunn_test(md, reformulate(groups, x),  
+                     p.adjust.method = "BH")
+})
+
+# Summarize Dunn Test results in one data frame
+MediatorDunnRes <- data.frame()
+
+for (i in 1:27) {
+  res_df <- data.frame(MediatorDunnTestRes[[i]])
+  MediatorDunnRes <- bind_rows(MediatorDunnRes, res_df)
+}
+
+# Format and export
+MediatorDunnRes_forpaper <- MediatorDunnRes %>%
+  dplyr::select(-c(n1, n2, statistic, p, p.adj.signif)) %>%
+  unite(Comparison, group1, group2, sep = " - ") %>%
+  mutate(p.adj = round(p.adj, digits = 7)) %>%
+  pivot_wider(names_from = '.y.', values_from = p.adj) %>%
+  t() %>% as.data.frame() %>%
+  row_to_names(row_number = 1) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  rownames_to_column("Variable")
+
+# Add worksheet and format worksheet for these results
+addWorksheet(wb, "Mediator_Dunn_Results")
+writeData(wb, "Mediator_Dunn_Results", MediatorDunnRes_forpaper)
+conditionalFormatting(wb, sheet = "Mediator_Dunn_Results", 
+                      cols = 2:6, rows = 2:28, rule = "<0.05", style = bold)
+
+# Write out table for paper.
+saveWorkbook(wb, "2_OutputTables/Variable_by_Variable_Supplemental_Results.xlsx", overwrite = TRUE)
+```
+
+## ANCOVA on mediator data
+
+ANCOVA will allow us to determine significant differences between group for each mediator while accounting for covariates. Choosing covariates is subjective, but here I included those that were significantly different in the demographics table, plus sex because of known differences between male and female airway immune responses and biology.
+
+ $~$
+
+First, data are log transformed to move data closer to a normal distribution, as there isn’t a non-parametric alternative to ANCOVA.
+
+```{r}
+# Add one to every data in the matrix and log2 transform to avoid negative values.
+md_log <- log2(md[1:27]+1)
+
+# Test normality of each sputum metric
+md_log_normality <- apply(md_log, 2, shapiro.test)
+
+# Create data frame to summarize results
+md_log_normality <- do.call(rbind.data.frame, md_log_normality)
+md_log_normality <- format(md_log_normality, scientific = FALSE)
+
+# Add column to adjust for multiple hypothesis testing
+md_log_normality$p.value.adj <- p.adjust(md_log_normality$p.value, "BH")
+
+# Add column for normality conclusion
+md_log_normality <- md_log_normality %>% mutate(normal = ifelse(p.value.adj < 0.05, F, T)) 
+
+datatable(md_log_normality)
+```
+
+Viewing histograms and Shapiro-Wilk p-values indicates that although log-transforming values does not make the data perfectly normal, it does get closer to normal.
+
+```{r}
+mediators_log2_histograms <- md_log %>% pivot_longer(all_of(colnames(md_log)), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(Value)) +
+  geom_histogram() +
+  facet_wrap(~ Variable, scales = "free")
+
+mediators_log2_histograms
+```
+
+$~$
+
+Perform ANCOVA on mediator data.
+```{r warning = FALSE}
+# Merge back metadata
+md_log <- transform(merge(demographics %>% dplyr::select(c(BMI:Sex, GoldStage, CurrentSmoker)), md_log, by = 0), row.names=Row.names, Row.names = NULL) %>% 
+  relocate(GoldStage)
+
+# Create empty data frame
+ANCOVAres_mediators = data.frame()
+
+# Add row names to data frame so that it will be able to add ANCOVA results
+rownames <- c("(Intercept)", "GoldStage", "BMI", "Age", "Sex", "CurrentSmoker", "Residuals")
+ANCOVAres_mediators <- data.frame(cbind(rownames))
+
+# Assign row names 
+ANCOVAres_mediators <- data.frame(ANCOVAres_mediators[, -1], row.names = ANCOVAres_mediators$rownames)
+
+# Perform ANCOVA over all columns in 
+for (i in 6:ncol(md_log)) {
+  
+  fit = aov(as.formula(paste0(names(md_log)[i], "~", paste0("`", names(md_log[1:5]), "`", collapse="+"), sep = "")), md_log)
+  res <- data.frame(car::Anova(fit, type="III"))
+  res <- subset(res, select = Pr..F.)
+  names(res)[names(res) == 'Pr..F.'] <- noquote(paste0(names(md_log[i])))
+  
+  ANCOVAres_mediators <- transform(merge(ANCOVAres_mediators, res, by = 0), row.names=Row.names, Row.names = NULL)
+}
+
+# Put columns in alphabetical order
+ANCOVAres_mediators <- ANCOVAres_mediators[, order(names(ANCOVAres_mediators))]
+
+# Transpose for easy viewing
+ANCOVAres_mediators <- data.frame(t(ANCOVAres_mediators))
+
+# Delete columns for intercept and residuals
+ANCOVAres_mediators <- subset(ANCOVAres_mediators, select = c(GoldStage, Sex, Age, BMI, CurrentSmoker))
+ANCOVAres_mediators_adj <- ANCOVAres_mediators %>%
+  mutate(across(everything(), p.adjust, "BH")) %>%
+  rownames_to_column("Variable")
+
+# Add worksheet and format worksheet for these results
+addWorksheet(wb, "Mediator_ANCOVA_Results")
+writeData(wb, "Mediator_ANCOVA_Results", ANCOVAres_mediators_adj)
+conditionalFormatting(wb, sheet = "Mediator_ANCOVA_Results", 
+                      cols = 2:6, rows = 2:28, rule = "<0.05", style = bold)
+
+# Write out table for paper.
+saveWorkbook(wb, "2_OutputTables/Variable_by_Variable_Supplemental_Results.xlsx", overwrite = TRUE)
+```
+
+Add GoldStage column to the summary data table.
+
+```{r}
+# Combine ANCOVA results with Kruskal-Wallis results/summary table
+md_summary_table_final <- md_summary_table_final %>%
+  left_join(ANCOVAres_mediators_adj %>% dplyr::select(c(GoldStage, Variable)), by = "Variable") %>%
+  rename("ANCOVA Adjusted P-Value (Adjusted Approach)" = "GoldStage")
+
+# Add worksheet and format worksheet for these results
+addWorksheet(wb, "Mediator_Summary_Table")
+writeData(wb, "Mediator_Summary_Table", md_summary_table_final)
+conditionalFormatting(wb, sheet = "Mediator_Summary_Table", 
+                      cols = 6:7, rows = 2:28, rule = "<0.05", style = bold)
+
+# Write out table for paper.
+saveWorkbook(wb, "2_OutputTables/Variable_by_Variable_Supplemental_Results.xlsx", overwrite = TRUE)
+```
+
+
+Perform Tukey’s post hoc to determine differences between specific groups.
+
+```{r}
+# Re-label stratum
+md_log$GoldStage <- factor(md_log$GoldStage, 
+                            levels=c("C", "p-COPD", "1/2", "3"), 
+                            labels=c("Control", "Pre-COPD","GOLD 1/2", "GOLD 3"))
+
+# Create empty data frame
+MediatorsTukeyRes <- data.frame()
+
+# Add row names to data frame so that it will be able to add ANCOVA results
+rownames_tukey <- c("Pre-COPD - Control", "GOLD 1/2 - Control", "GOLD 3 - Control", "GOLD 1/2 - Pre-COPD", "GOLD 3 - Pre-COPD", "GOLD 3 - GOLD 1/2")
+MediatorsTukeyRes <- data.frame(cbind(rownames_tukey))
+
+# Assign row names 
+MediatorsTukeyRes <- data.frame(MediatorsTukeyRes[, -1], row.names = MediatorsTukeyRes$rownames_tukey)
+
+# Perform Tukey test
+for (i in 6:ncol(md_log)) {
+  
+  fit = aov(as.formula(paste0(names(md_log)[i], "~", paste0("`", names(md_log[1:5]), "`", collapse="+"), sep = "")), 
+            md_log)
+  
+  posthoc <- summary(glht(fit, linfct = mcp(GoldStage = "Tukey")), test = adjusted("BH"))
+  
+  res <- summary(posthoc)$test
+  
+  res_df <- data.frame(cbind (res$coefficients, res$sigma, res$tstat, res$pvalues))
+  colnames(res_df) <- c("Estimate", "Std.Error", "t.value", "Pr(>|t|)")
+  res_df <- res_df[4]
+  names(res_df)[names(res_df) == 'Pr(>|t|)'] <- noquote(paste0(names(md_log[i])))
+  
+  MediatorsTukeyRes <- transform(merge(MediatorsTukeyRes, res_df, by = 0), row.names=Row.names, Row.names = NULL)
+}
+
+# Reformat results for paper
+MediatorsTukeyRes_forpaper <- MediatorsTukeyRes %>%
+  rownames_to_column("Comparison") %>%
+  t() %>% as.data.frame() %>%
+  row_to_names(row_number = 1) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  rownames_to_column("Variable")
+
+# Add worksheet and format worksheet for these results
+addWorksheet(wb, "Mediator_ANCOVA_Tukey_Results")
+writeData(wb, "Mediator_ANCOVA_Tukey_Results", MediatorsTukeyRes_forpaper)
+conditionalFormatting(wb, sheet = "Mediator_ANCOVA_Tukey_Results", 
+                      cols = 2:6, rows = 2:28, rule = "<0.05", style = bold)
+
+# Write out table for paper.
+saveWorkbook(wb, "2_OutputTables/Variable_by_Variable_Supplemental_Results.xlsx", overwrite = TRUE)
+```
+## Graphing a subset of (ANCOVA) statistically significant mediators
+
+### Visualize overall patterns in mediators
+```{r}
+# Filter mediators to only those that were statistically significant using ANCOVA. First, make a vector of proteins that had p < 0.05 for Gold Stratum in ANCOVA
+ANCOVAres_mediators_signif <- ANCOVAres_mediators_adj %>%
+  filter(GoldStage < 0.05)
+
+ANCOVAres_mediators_signif <- ANCOVAres_mediators_signif$Variable
+
+# Make pattern line chart to see whether all were the same pattern or not between groups
+md_means_forgraph <- md %>%
+  dplyr::select(c(ALB:VEGF, GoldStage)) %>%
+  group_by(GoldStage) %>%
+  summarise(across(everything(), mean, na.rm = TRUE)) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value") %>%
+  filter(Variable %in% ANCOVAres_mediators_signif) %>%
+  mutate(GoldStage = recode(GoldStage, "Control" = "C", "Pre-COPD" = "P", "GOLD 1/2" = "1/2", "GOLD 3" = "3"))
+
+mediator_lineplots <- ggplot(md_means_forgraph, aes(x = GoldStage, y = Value)) +
+  geom_line(group = 1) +
+  geom_point() +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.7))) +
+  labs(y = "Concentration (pg/mL)",
+       x = "Group") +
+  facet_wrap(~Variable, scales = "free_y", nrow = 5) +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 9, color = "black"),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.title.y = element_text(size = 10, margin = margin(t = 0, r = 10, b = 0, l = 0, unit = "pt")),
+        axis.title.x = element_text(size = 10, margin = margin(t = 10, r = 0, b = 0, l = 0, unit = "pt")),
+        legend.position = "none",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+pdf("4_OutputFigs/SolubleMediatorLinePlot_Raw.pdf",
+    colormodel = "cmyk",
+    bg = "transparent",
+    width = 6,
+    height = 6)
+
+mediator_lineplots
+
+invisible(dev.off())
+```
+
+Preparations for graphing:
+
+```{r}
+md_log_forgraph <- md_log %>%
+  dplyr::select(c(GoldStage, all_of(ANCOVAres_mediators_signif))) %>%
+  pivot_longer(!GoldStage, names_to = "Variable", values_to = "Value")
+
+heights_forgraph <- md_log_forgraph %>%
+  group_by(Variable) %>%
+  mutate(height = max(Value) * 1.5) %>%
+  unite(Comparison_Variable, GoldStage, Variable, sep = "_")
+
+label_df <- MediatorsTukeyRes %>%
+  dplyr::select(all_of(ANCOVAres_mediators_signif)) %>%
+  rownames_to_column("Comparison") %>%
+  separate(Comparison, into = c("g1", "g2"), sep = " - ")
+
+label_df_s1 <- label_df %>%
+  filter(g1 == "Control" | g2 == "Control") %>%
+  mutate_all(~gsub("Control", "", .)) %>%
+  unite(Comparison, g1, g2, sep = "") %>%
+  add_row(Comparison = "Control") %>%
+  pivot_longer(!Comparison, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value < 0.05, "C", "")) %>%
+  mutate(Value = replace_na(Value, "")) %>%
+  unite(Comparison_Variable, Comparison, Variable, sep = "_") %>%
+  rename("Value_1" = "Value")
+
+label_df_s2 <- label_df %>%
+  filter(g1 == "Pre-COPD" | g2 == "Pre-COPD") %>%
+  mutate_all(~gsub("Pre-COPD", "", .)) %>%
+  unite(Comparison, g1, g2, sep = "") %>%
+  add_row(Comparison = "Pre-COPD") %>%
+  pivot_longer(!Comparison, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value < 0.05, "P", "")) %>%
+  mutate(Value = replace_na(Value, "")) %>%
+  unite(Comparison_Variable, Comparison, Variable, sep = "_") %>%
+  rename("Value_2" = "Value")
+
+label_df_s3 <- label_df %>%
+  filter(g1 == "GOLD 1/2" | g2 == "GOLD 1/2") %>%
+  mutate_all(~gsub("GOLD 1/2", "", .)) %>%
+  unite(Comparison, g1, g2, sep = "") %>%
+  add_row(Comparison = "GOLD 1/2") %>%
+  pivot_longer(!Comparison, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value < 0.05, "1/2", "")) %>%
+  mutate(Value = replace_na(Value, "")) %>%
+  unite(Comparison_Variable, Comparison, Variable, sep = "_") %>%
+  rename("Value_3" = "Value")
+
+label_df_s4 <- label_df %>%
+  filter(g1 == "GOLD 3" | g2 == "GOLD 3") %>%
+  mutate_all(~gsub("GOLD 3", "", .)) %>%
+  unite(Comparison, g1, g2, sep = "") %>%
+  add_row(Comparison = "GOLD 3") %>%
+  pivot_longer(!Comparison, names_to = "Variable", values_to = "Value") %>%
+  mutate(Value = ifelse(Value < 0.05, "3", "")) %>%
+  mutate(Value = replace_na(Value, "")) %>%
+  unite(Comparison_Variable, Comparison, Variable, sep = "_") %>%
+  rename("Value_4" = "Value")
+
+all_dfs <- list(label_df_s1, label_df_s2, label_df_s3, label_df_s4)
+
+# Combine data frames using reduce function. Then combine each column to make labels.
+label_df_final <- all_dfs %>%
+  reduce(full_join, by = "Comparison_Variable") %>%
+  mutate_if(is.character, list(~na_if(.,""))) %>%
+  unite(Label, Value_1, Value_2, Value_3, Value_4, sep = ",", na.rm = TRUE) %>%
+  left_join(heights_forgraph %>% dplyr::select(-Value), by = "Comparison_Variable") %>%
+  separate(Comparison_Variable, into = c("Comparison", "Variable"), sep = "_") %>%
+  rename("GoldStage" = "Comparison") %>%
+  mutate(Label = ifelse(GoldStage == "Control", "", Label)) %>% # Remove labels for stratum 1 since they are duplicates
+  mutate(Label = ifelse(Label == "3", "", Label)) # Remove label for if only group 4 is significant, as this will be captured by other labels
+```
+
+Now we can make a graph with the annotations. Here, increased in stratum 4 only:
+```{r}
+# Increased in stratum 4 only
+s4only_variables <- c("CRP", "IL10", "IL12p40", "IL12p70", "IL1B", "IL8", "IP10", "MIG", "sVCAM1", "TNFa")
+
+md_log_forgraph_s4only <- md_log_forgraph %>%
+  filter(Variable %in% s4only_variables)
+
+label_df_final_s4only <- label_df_final %>%
+  filter(Variable %in% s4only_variables)
+
+# Make graph
+theme_set(theme_bw())
+
+mediator_figurepanel_withsig_s4only <- ggplot(md_log_forgraph_s4only) +
+  geom_boxplot(aes(x = GoldStage, y = Value, fill = GoldStage), color = "black", outlier.shape = NA) +
+  geom_jitter(aes(x = GoldStage, y = Value, fill = GoldStage), position = position_jitter(0.15), 
+              shape = 20) +
+  geom_text(data = label_df_final_s4only, aes(x = GoldStage, y = height, 
+                                       label = paste0(Label)), size = 3) +
+  labs(y = "Log2 (Concentration (pg/mL))",
+       x = "Group") +
+  facet_wrap( ~Variable, scales = "free_y", nrow = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.2))) +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 10, color = "black", angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.title.y = element_text(size = 12, margin = margin(t = 0, r = 10, b = 0, l = 0, unit = "pt")),
+        axis.title.x = element_text(size = 12, margin = margin(t = 10, r = 0, b = 0, l = 0, unit = "pt")),
+        legend.position = "none",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  scale_fill_viridis_d(begin = 0.25, end = 1, option = "B")
+
+mediator_figurepanel_withsig_s4only
+
+pdf("4_OutputFigs/SolubleMediatorFigurePanel_LogTransformed_WithSig_S4Only.pdf",
+    colormodel = "cmyk",
+    bg = "transparent",
+    width = 9,
+    height = 6)
+
+mediator_figurepanel_withsig_s4only
+
+invisible(dev.off())
+```
+Now we can make a graph with the annotations. Here, increased in stratum 2 and 4:
+```{r}
+# Increased in stratum 4 only
+s2s4_variables <- c("MMP9", "MPO", "NE", "TIMP1", "TIMP2")
+
+md_log_forgraph_s2s4 <- md_log_forgraph %>%
+  filter(Variable %in% s2s4_variables)
+
+label_df_final_s2s4 <- label_df_final %>%
+  filter(Variable %in% s2s4_variables)
+
+# Make graph
+theme_set(theme_bw())
+
+mediator_figurepanel_withsig_s2s4 <- ggplot(md_log_forgraph_s2s4) +
+  geom_boxplot(aes(x = GoldStage, y = Value, fill = GoldStage), color = "black", outlier.shape = NA) +
+  geom_jitter(aes(x = GoldStage, y = Value, fill = GoldStage), position = position_jitter(0.15), 
+              shape = 20) +
+  geom_text(data = label_df_final_s2s4, aes(x = GoldStage, y = height, 
+                                       label = paste0(Label)), size = 3) +
+  labs(y = "Log2 (Concentration (pg/mL))",
+       x = "Group") +
+  facet_wrap( ~Variable, scales = "free_y", nrow = 2, ncol = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0.25, 0.2))) +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(size = 10, color = "black", angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8, color = "black"),
+        axis.title.y = element_text(size = 12, margin = margin(t = 0, r = 10, b = 0, l = 0, unit = "pt")),
+        axis.title.x = element_text(size = 12, margin = margin(t = 10, r = 0, b = 0, l = 0, unit = "pt")),
+        legend.position = "none",
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  scale_fill_viridis_d(begin = 0.25, end = 1, option = "B")
+
+mediator_figurepanel_withsig_s2s4
+
+pdf("4_OutputFigs/SolubleMediatorFigurePanel_LogTransformed_WithSig_S2S4.pdf",
+    colormodel = "cmyk",
+    bg = "transparent",
+    width = 6,
+    height = 4.25)
+
+mediator_figurepanel_withsig_s2s4
+
+invisible(dev.off())
+```
+
+# Write out file needed for predictive modeling code.
+```{r}
+write.xlsx(md %>% rownames_to_column("SubjectID"), file = "5_ProcessedData/processed_md_data.xlsx")
+```
