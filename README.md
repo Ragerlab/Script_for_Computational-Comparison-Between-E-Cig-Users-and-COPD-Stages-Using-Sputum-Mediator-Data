@@ -1,8 +1,8 @@
-# Script_for_Computational-Comparison-Between-E-Cig-Users-and-COPD-Stages-Using-Sputum-Mediator-Data
+# Script for "Similarity of Sputum Mediator Signatures Between E-Cigarette Users and COPD Depends on GOLD Stage and Type of E-Cigarette: A Pilot Study"
 
-Script for *Computational Comparison Between E-Cig Users and COPD Stages Using Sputum Mediator Data* (manuscript currently in submission).
+Script author: Elise Hickman (ehickman@email.unc.edu)
 
-This study set out to compare induced sputum soluble mediator profiles between e-cigarette users and participants with different stages of COPD using a suite of computational approaches. 
+This study set out to compare induced sputum soluble mediator profiles between e-cigarette users and participants with different stages of COPD using a suite of computational approaches (manuscript currently in submission). 
 
 **1_SummaryTables_VariablebyVariable:** Analysis specific to between COPD stages only, including creation of summary tables and variable by variable analyses across the COPD stages. 
 
